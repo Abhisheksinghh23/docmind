@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DocMind</title>
+<style>
+  :root { --ink:#1b1f2a; --muted:#5b6475; --line:#dde1ea; --bg:#f6f7fb; --accent:#3a5bd9; --ok:#1f7a4d; --warn:#9a5b00; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; color:var(--ink); background:var(--bg); }
+  main { max-width: 760px; margin: 0 auto; padding: 24px 16px 48px; }
+  h1 { font-size: 28px; margin: 8px 0 4px; }
+  .sub { color: var(--muted); margin: 0 0 20px; }
+  .card { background:#fff; border:1px solid var(--line); border-radius:12px; padding:16px; margin-bottom:16px; }
+  h2 { font-size: 15px; text-transform: uppercase; letter-spacing:.04em; color:var(--muted); margin:0 0 10px; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; }
+  input[type=text] { flex:1 1 220px; padding:12px; border:1px solid var(--line); border-radius:8px; font:inherit; min-width:0; }
+  button { padding:12px 18px; border:0; border-radius:8px; background:var(--accent); color:#fff; font:inherit; cursor:pointer; }
+  button:disabled { opacity:.6; cursor:default; }
+  button.secondary { background:#fff; color:var(--accent); border:1px solid var(--accent); }
+  ul.docs { list-style:none; padding:0; margin:12px 0 0; }
+  ul.docs li { display:flex; justify-content:space-between; padding:8px 10px; border:1px solid var(--line); border-radius:8px; margin-top:6px; font-size:14px; }
+  .answer { font-size:18px; }
+  .cite { display:inline-block; font-size:12px; background:#e8edff; color:var(--accent); border-radius:6px; padding:0 6px; margin-left:4px; vertical-align:middle; }
+  .source { border-left:3px solid var(--accent); padding:6px 10px; margin-top:10px; background:#f9faff; font-size:14px; }
+  .source .meta { color:var(--muted); font-size:12px; }
+  .abstain { color:var(--warn); }
+  .msg { font-size:14px; color:var(--muted); margin-top:8px; }
+  .ok { color:var(--ok); }
+  @media (max-width: 480px) { h1 { font-size: 24px; } button { flex: 1 1 100%; } }
+</style>
+</head>
+<body>
+<main>
+  <h1>DocMind</h1>
+  <p class="sub">Ask a question about your documents. Everything runs in your browser: files are never uploaded. Answers quote the exact passage with file and page. If the documents don't say, DocMind says so.</p>
+
+  <section class="card">
+    <h2>1. Add documents (.txt, .md or .pdf)</h2>
+    <div class="row">
+      <input id="file" type="file" accept=".txt,.md,.pdf" multiple aria-label="Choose documents">
+      <button id="upload" class="secondary">Add</button>
+    </div>
+    <div id="upmsg" class="msg" role="status"></div>
+    <ul id="docs" class="docs"></ul>
+    <div id="load" class="msg" role="status">Loading models (first visit loads roughly 85-87 MB of uncompressed model and runtime files (actual download varies); large on mobile data)...</div>
+  </section>
+
+  <section class="card">
+    <h2>2. Ask</h2>
+    <form id="askform" class="row">
+      <input id="q" type="text" placeholder="e.g. How many days of annual leave do employees get?" maxlength="500" aria-label="Your question" required>
+      <button id="ask" type="submit">Ask</button>
+    </form>
+    <div id="result" aria-live="polite"></div>
+  </section>
+</main>
+<script type="module">
+import { loadModels, Index, chunkPage, answer, extractPdf } from "./core.js";
+import * as pdfjs from "./pdf.min.mjs";
+pdfjs.GlobalWorkerOptions.workerSrc = new URL("./pdf.worker.min.mjs", location.href).href;
+import * as T from "https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.3.2/dist/transformers.min.js";
+T.env.allowLocalModels = false;
+T.env.backends.onnx.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.31.0-dev.20260914-8d85527a0/dist/";
+T.env.backends.onnx.wasm.numThreads = 1;
+const $ = id => document.getElementById(id);
+const esc = s => s.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+let index = null; const docs = {};
+$('upload').disabled = true; $('ask').disabled = true;
+const files = {};
+const onProg = p => { if (p.status === 'progress' && p.file) { files[p.file] = p; const l = Object.values(files), t = l.reduce((a, x) => a + (x.total||0), 0), d = l.reduce((a, x) => a + (x.loaded||0), 0); if (t) $('load').textContent = `Loading models: ${(d/1e6).toFixed(0)} of ${(t/1e6).toFixed(0)} MB`; } };
+try {
+  const t0 = performance.now();
+  index = new Index(await loadModels(T, onProg));
+  window.__ready = true;
+  $('load').innerHTML = `<span class="ok">Models ready (${((performance.now()-t0)/1000).toFixed(1)} s).</span>`;
+  $('upload').disabled = false; $('ask').disabled = false;
+} catch (e) { $('load').textContent = 'Could not load the models: ' + e.message; }
+function refresh() {
+  const n = Object.entries(docs);
+  $('docs').innerHTML = n.length ? n.map(([k, c]) => `<li><span>${esc(k)}</span><span>${c} passages</span></li>`).join('') : '<li><span>No documents yet</span><span></span></li>';
+}
+$('upload').onclick = async () => {
+  const fl = $('file').files;
+  if (!fl.length) { $('upmsg').textContent = 'Choose at least one file first.'; return; }
+  $('upload').disabled = true; $('upmsg').textContent = 'Indexing in your browser...';
+  const out = [];
+  for (const f of fl) {
+    const name = esc(f.name);
+    try {
+      let ch = [];
+      if (/\.pdf$/i.test(f.name)) {
+        const r = await extractPdf(pdfjs, new Uint8Array(await f.arrayBuffer()));
+        if (r.scanned) { out.push(`${name}: no selectable text. This looks like a scanned PDF, which is not supported (no OCR). Use a PDF with real text.`); continue; }
+        for (const p of r.pages) ch.push(...chunkPage(f.name, p.page, p.text));
+        out.push(`${name}: ${ch.length} passages from ${r.pages.length} of ${r.numPages} pages` + (r.emptyPages.length ? ` (no text on page ${r.emptyPages.join(', ')}: skipped, may be scanned)` : ''));
+      } else if (/\.(txt|md)$/i.test(f.name)) {
+        ch = chunkPage(f.name, 1, await f.text()); out.push(`${name}: ${ch.length} passages`);
+      } else { out.push(`${name}: unsupported type (use .txt, .md or .pdf)`); continue; }
+      if (docs[f.name]) index.removeSource(f.name);
+      await index.add(ch); docs[f.name] = ch.length;
+    } catch (e) { out.push(`${name}: could not read (${esc(e.message)})`); }
+  }
+  $('upmsg').innerHTML = out.join('<br>'); $('upload').disabled = false; refresh(); window.__indexed = true;
+};
+$('askform').onsubmit = async e => {
+  e.preventDefault();
+  $('ask').disabled = true; $('result').innerHTML = '<p class="msg">Searching...</p>';
+  const a = await answer(index, $('q').value);
+  if (a.abstained) { $('result').innerHTML = '<p class="answer abstain">The documents do not contain a clear answer to that.</p>'; }
+  else {
+    const text = a.citations.map(c => `${esc(c.quote)}<span class="cite">${c.n}</span>`).join(' ');
+    const src = a.citations.map(c => `<div class="source"><div class="meta">[${c.n}] ${esc(c.source)}, page ${c.page}</div>${esc(c.quote)}</div>`).join('');
+    $('result').innerHTML = `<p class="answer">${text}</p>${src}`;
+  }
+  $('ask').disabled = false; window.__answered = true;
+};
+refresh();
+</script>
+</body>
+</html>
