@@ -113,11 +113,16 @@ export async function answer(index, question, k = 3, maxSentences = 2) {
   for (const [, s, c] of cands.slice(0, 8)) if (!seen.has(s)) { seen.add(s); uniq.push([s, c]); }
   const scores = await index.models.rerank(question, uniq.map(u => u[0]));
   const ranked = uniq.map((u, i) => [scores[i], ...u]).sort((a, b) => b[0] - a[0]);
+  // Answer-type check: "when / how many / how long / latest / deadline" questions need a sentence that
+  // contains a number, date or time word. Related sentences without one are not answers.
+  const wantsValue = /^\s*(when|how (many|much|long|often|soon|far|old|fast|big))\b|\b(latest|earliest|deadline|by when|what date|what time)\b/i.test(question);
+  const hasValue = s => /\d|\b(one|two|three|four|five|six|seven|eight|nine|ten|twelve|hundred|thousand|daily|weekly|monthly|yearly|annual|quarterly|hourly|today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|january|february|march|april|may|june|july|august|september|october|november|december)\b/i.test(s);
+  if (wantsValue) for (let i = ranked.length - 1; i >= 0; i--) if (!hasValue(ranked[i][1])) ranked.splice(i, 1);
   let good = ranked.filter(x => x[0] > MIN_RERANK), lowConfidence = false;
   if (good.length) {
     const best = good[0][0];
     good = good.filter(x => x[0] >= SECOND_RATIO * best).slice(0, maxSentences);
-  } else if (ranked.length > 1 && ranked[0][0] > LOW_FLOOR && ranked[0][0] - ranked[1][0] >= LOW_MARGIN
+  } else if (!wantsValue && ranked.length > 1 && ranked[0][0] > LOW_FLOOR && ranked[0][0] - ranked[1][0] >= LOW_MARGIN
              && sharesSpecificTerm(qTerms, ranked[0][1], ranked[0][2].source)) {
     good = [ranked[0]]; lowConfidence = true;
   }
