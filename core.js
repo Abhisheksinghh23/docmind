@@ -88,6 +88,14 @@ export class Index {
     return [...fused].sort((a, b) => b[1] - a[1]).slice(0, k).map(([id]) => by.get(id));
   }
 }
+// A low-confidence line must contain a question word that is not just the document's own topic word
+// (a word from its file name, e.g. "invoice" in invoice.pdf), otherwise it is only topically related.
+function sharesSpecificTerm(qTerms, sentence, source) {
+  const topic = new Set(tokenize(String(source).replace(/\.[a-z0-9]+$/i, "")));
+  const st = new Set(tokenize(sentence));
+  for (const t of qTerms) if (!topic.has(t) && st.has(t)) return true;
+  return false;
+}
 export async function answer(index, question, k = 3, maxSentences = 2) {
   const qTerms = new Set(tokenize(question));
   const hits = await index.search(question, k);
@@ -109,7 +117,8 @@ export async function answer(index, question, k = 3, maxSentences = 2) {
   if (good.length) {
     const best = good[0][0];
     good = good.filter(x => x[0] >= SECOND_RATIO * best).slice(0, maxSentences);
-  } else if (ranked.length > 1 && ranked[0][0] > LOW_FLOOR && ranked[0][0] - ranked[1][0] >= LOW_MARGIN) {
+  } else if (ranked.length > 1 && ranked[0][0] > LOW_FLOOR && ranked[0][0] - ranked[1][0] >= LOW_MARGIN
+             && sharesSpecificTerm(qTerms, ranked[0][1], ranked[0][2].source)) {
     good = [ranked[0]]; lowConfidence = true;
   }
   if (!good.length) return { question, answer: null, abstained: true, citations: [] };
