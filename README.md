@@ -11,3 +11,6 @@ Extractive retrieval, not generative: every answer is a sentence copied verbatim
 Transformers.js 4.3.2 and the runtime WASM load from pinned jsDelivr URLs, not from this repo.
 
 Open index.html over http(s) (it uses ES modules), for example `python3 -m http.server`. Live demo: GitHub Pages for this repo.
+
+## Answer confidence
+Answers come from a cross-encoder trained on web text. Short fragments such as resume lines or bullets often score low, so a best match that is below the confident threshold but clearly stands out is shown with a "Low confidence" label instead of being hidden. Checked on small self-made and small realistic test documents only, so expect wrong low-confidence matches and some missed answers.

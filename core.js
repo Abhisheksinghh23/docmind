@@ -5,17 +5,43 @@ export const MIN_RERANK = 0.0;
 // A second sentence is quoted only if its score is at least this share of the best sentence's score.
 // Stops loosely related filler from riding along with a strong answer. Not tuned on the eval set.
 export const SECOND_RATIO = 0.5;
+// The cross-encoder was trained on web passages and scores short fragments (resume lines, bullets,
+// "CGPA: 8.7 / 10") below 0 even when they are the right sentence. So a sentence at or below 0 is quoted
+// only as a LOW-CONFIDENCE best match, and only if it is not hopeless (LOW_FLOOR) and clearly stands out
+// from every other candidate (LOW_MARGIN). Both values were chosen by looking at score distributions on the
+// project's own sample questions and a few small realistic documents, so they are tuned, not independently proven.
+export const LOW_FLOOR = -7;
+export const LOW_MARGIN = 3.5;
 const SENT = /(?<=[.!?])\s+|\n{2,}/;
 const QPREFIX = "Represent this sentence for searching relevant passages: ";
 
+// Line handling: PDFs, resumes and notes break lines without punctuation. A line break joins two lines
+// only when it looks like a wrapped sentence; headings, bullets and short lines stay separate units.
+const BULLET = /^\s*([-*\u2022\u25aa\u25cf]|\d+[.)])\s/;
+function logicalLines(text) {
+  const out = [];
+  for (const para of text.split(/\n{2,}/)) {
+    const lines = para.split("\n").map(l => l.replace(/\s+/g, " ").trim()).filter(Boolean);
+    let cur = "";
+    for (const ln of lines) {
+      if (!cur) { cur = ln; continue; }
+      const wrapped = cur.length >= 55 && !/[.!?:;]$/.test(cur) && !BULLET.test(ln) && (/^[a-z]/.test(ln) || cur.length >= 85);
+      if (wrapped) cur += " " + ln; else { out.push(cur); cur = ln; }
+    }
+    if (cur) out.push(cur);
+  }
+  return out;
+}
 export function splitSentences(text) {
   text = text.replace(/^#+\s*(.+?)\s*$/gm, (_m, t) => t.replace(/\.+$/, "") + ".");
-  return text.split(SENT).map(s => s.replace(/\s+/g, " ").trim()).filter(Boolean);
+  const out = [];
+  for (const line of logicalLines(text)) for (const s of line.split(/(?<=[.!?])\s+/)) { const t = s.trim(); if (t) out.push(t); }
+  return out;
 }
 export function chunkPage(source, page, text, maxChars = 600, overlap = 1) {
   const sents = splitSentences(text), chunks = [];
   let cur = [], size = 0, n = 0;
-  const flush = () => { if (cur.length) { chunks.push({ id: `${source}#p${page}-${n}`, source, page, text: cur.join(" ") }); n++; } };
+  const flush = () => { if (cur.length) { chunks.push({ id: `${source}#p${page}-${n}`, source, page, text: cur.join(" "), sents: cur.slice() }); n++; } };
   for (const s of sents) {
     if (cur.length && size + s.length + 1 > maxChars) {
       flush(); cur = overlap ? cur.slice(-overlap) : []; size = cur.reduce((a, x) => a + x.length + 1, 0);
@@ -68,7 +94,7 @@ export async function answer(index, question, k = 3, maxSentences = 2) {
   if (!hits.length || !qTerms.size) return { question, answer: null, abstained: true, citations: [] };
   const qv = await index.models.embedQuery(question), cands = [];
   for (const chunk of hits) {
-    const sents = splitSentences(chunk.text), vs = await index.models.embedDocs(sents);
+    const sents = chunk.sents || splitSentences(chunk.text), vs = await index.models.embedDocs(sents);
     sents.forEach((s, i) => {
       const toks = new Set(tokenize(s)); let ov = 0; for (const t of toks) if (qTerms.has(t)) ov++;
       const sim = cosine(qv, vs[i]); cands.push([sim + 0.15 * ov / qTerms.size, s, chunk]);
@@ -78,12 +104,17 @@ export async function answer(index, question, k = 3, maxSentences = 2) {
   const uniq = [], seen = new Set();
   for (const [, s, c] of cands.slice(0, 8)) if (!seen.has(s)) { seen.add(s); uniq.push([s, c]); }
   const scores = await index.models.rerank(question, uniq.map(u => u[0]));
-  let good = uniq.map((u, i) => [scores[i], ...u]).sort((a, b) => b[0] - a[0]).filter(x => x[0] > MIN_RERANK);
-  const best = good.length ? good[0][0] : 0;
-  good = good.filter(x => x[0] >= SECOND_RATIO * best).slice(0, maxSentences);
+  const ranked = uniq.map((u, i) => [scores[i], ...u]).sort((a, b) => b[0] - a[0]);
+  let good = ranked.filter(x => x[0] > MIN_RERANK), lowConfidence = false;
+  if (good.length) {
+    const best = good[0][0];
+    good = good.filter(x => x[0] >= SECOND_RATIO * best).slice(0, maxSentences);
+  } else if (ranked.length > 1 && ranked[0][0] > LOW_FLOOR && ranked[0][0] - ranked[1][0] >= LOW_MARGIN) {
+    good = [ranked[0]]; lowConfidence = true;
+  }
   if (!good.length) return { question, answer: null, abstained: true, citations: [] };
   const citations = good.map(([sc, s, c], i) => ({ n: i + 1, source: c.source, page: c.page, chunkId: c.id, quote: s, score: +sc.toFixed(3) }));
-  return { question, answer: citations.map(c => `${c.quote} [${c.n}]`).join(" "), abstained: false, citations };
+  return { question, answer: citations.map(c => `${c.quote} [${c.n}]`).join(" "), abstained: false, lowConfidence, citations };
 }
 
 // Models via Transformers.js (ONNX). `T` is the imported transformers module.
@@ -113,7 +144,9 @@ export async function extractPdf(pdfjs, data) {
   const doc = await pdfjs.getDocument({ data }).promise, pages = [], emptyPages = [];
   for (let n = 1; n <= doc.numPages; n++) {
     const tc = await (await doc.getPage(n)).getTextContent();
-    const text = tc.items.map(i => i.str + (i.hasEOL ? "\n" : " ")).join("").replace(/[ \t]+/g, " ").replace(/ ?\n ?/g, "\n").trim();
+    let lastY = null, buf = "";
+    for (const i of tc.items) { const y = i.transform ? i.transform[5] : null; if (buf && lastY !== null && y !== null && Math.abs(y - lastY) > 2 && !buf.endsWith("\n")) buf += "\n"; buf += i.str + (i.hasEOL ? "\n" : " "); if (y !== null && i.str.trim()) lastY = y; }
+    const text = buf.replace(/[ \t]+/g, " ").replace(/ ?\n ?/g, "\n").trim();
     if (text.replace(/\s/g, "").length >= 10) pages.push({ page: n, text }); else emptyPages.push(n);
   }
   return { pages, emptyPages, scanned: pages.length === 0, numPages: doc.numPages };

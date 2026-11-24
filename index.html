@@ -111,7 +111,8 @@ $('askform').onsubmit = async e => {
   else {
     const text = a.citations.map(c => `${esc(c.quote)}<span class="cite">${c.n}</span>`).join(' ');
     const src = a.citations.map(c => `<div class="source"><div class="meta">[${c.n}] ${esc(c.source)}, page ${c.page}</div>${esc(c.quote)}</div>`).join('');
-    $('result').innerHTML = `<p class="answer">${text}</p>${src}`;
+    const lc = a.lowConfidence ? '<p class="msg abstain">Low confidence: best matching line, not a clear answer. Check the source below.</p>' : '';
+    $('result').innerHTML = `${lc}<p class="answer">${text}</p>${src}`;
   }
   $('ask').disabled = false; window.__answered = true;
 };
