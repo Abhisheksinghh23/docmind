@@ -32,8 +32,9 @@ function logicalLines(text) {
   }
   return out;
 }
+const HEADINGS = new Set(); // markdown headings: never a low-confidence answer
 export function splitSentences(text) {
-  text = text.replace(/^#+\s*(.+?)\s*$/gm, (_m, t) => t.replace(/\.+$/, "") + ".");
+  text = text.replace(/^#+\s*(.+?)\s*$/gm, (_m, t) => { const h = t.replace(/\.+$/, "") + "."; HEADINGS.add(h); return h; });
   const out = [];
   for (const line of logicalLines(text)) for (const s of line.split(/(?<=[.!?])\s+/)) { const t = s.trim(); if (t) out.push(t); }
   return out;
@@ -90,11 +91,15 @@ export class Index {
 }
 // A low-confidence line must contain a question word that is not just the document's own topic word
 // (a word from its file name, e.g. "invoice" in invoice.pdf), otherwise it is only topically related.
+// It must also match at least half of the question's other words, and must not be a heading.
 function sharesSpecificTerm(qTerms, sentence, source) {
+  if (HEADINGS.has(sentence)) return false;
   const topic = new Set(tokenize(String(source).replace(/\.[a-z0-9]+$/i, "")));
   const st = new Set(tokenize(sentence));
-  for (const t of qTerms) if (!topic.has(t) && st.has(t)) return true;
-  return false;
+  const specific = [...qTerms].filter(t => t.length > 1 && !topic.has(t));
+  const match = t => st.has(t) || (t.length >= 5 && [...st].some(w => w.length >= 5 && w.slice(0, 5) === t.slice(0, 5)));
+  const hits = specific.filter(match).length;
+  return hits >= 1 && hits >= Math.ceil(specific.length / 2);
 }
 export async function answer(index, question, k = 3, maxSentences = 2) {
   const qTerms = new Set(tokenize(question));
@@ -104,19 +109,26 @@ export async function answer(index, question, k = 3, maxSentences = 2) {
   for (const chunk of hits) {
     const sents = chunk.sents || splitSentences(chunk.text), vs = await index.models.embedDocs(sents);
     sents.forEach((s, i) => {
+      let prev = i > 0 ? sents[i - 1] : "";
+      if (/^\s*#/.test(prev) || prev.trim().split(/\s+/).length <= 3) prev = ""; // headings and labels are not context
       const toks = new Set(tokenize(s)); let ov = 0; for (const t of toks) if (qTerms.has(t)) ov++;
-      const sim = cosine(qv, vs[i]); cands.push([sim + 0.15 * ov / qTerms.size, s, chunk]);
+      const sim = cosine(qv, vs[i]); cands.push([sim + 0.15 * ov / qTerms.size, s, chunk, prev]);
     });
   }
   cands.sort((a, b) => b[0] - a[0]);
   const uniq = [], seen = new Set();
-  for (const [, s, c] of cands.slice(0, 8)) if (!seen.has(s)) { seen.add(s); uniq.push([s, c]); }
-  const scores = await index.models.rerank(question, uniq.map(u => u[0]));
+  for (const [, s, c, p] of cands.slice(0, 8)) if (!seen.has(s)) { seen.add(s); uniq.push([s, c, p]); }
+  // Context-aware scoring: a sentence that leans on the one before it ("Serve hot with ...") is also scored
+  // together with that previous sentence. The better of the two scores is used; only the sentence itself is quoted.
+  const own = await index.models.rerank(question, uniq.map(u => u[0]));
+  const withCtx = uniq.map((u, i) => i).filter(i => uniq[i][2]);
+  const ctxS = withCtx.length ? await index.models.rerank(question, withCtx.map(i => uniq[i][2] + " " + uniq[i][0])) : [];
+  const scores = own.slice(); withCtx.forEach((i, j) => { if (ctxS[j] > scores[i]) scores[i] = ctxS[j]; });
   const ranked = uniq.map((u, i) => [scores[i], ...u]).sort((a, b) => b[0] - a[0]);
   // Answer-type check: "when / how many / how long / latest / deadline" questions need a sentence that
   // contains a number, date or time word. Related sentences without one are not answers.
   const wantsValue = /^\s*(when|how (many|much|long|often|soon|far|old|fast|big))\b|\b(latest|earliest|deadline|by when|what date|what time)\b/i.test(question);
-  const hasValue = s => /\d|\b(one|two|three|four|five|six|seven|eight|nine|ten|twelve|hundred|thousand|daily|weekly|monthly|yearly|annual|quarterly|hourly|today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|january|february|march|april|may|june|july|august|september|october|november|december)\b/i.test(s);
+  const hasValue = s => /\d|\b(one|two|three|four|five|six|seven|eight|nine|ten|twelve|hundred|thousand|free|nothing|none|no charge|no cost|half|double|immediately|upon|after|before|until|once|during|within|following|next|every|each|per|never|always|daily|weekly|monthly|yearly|annual|quarterly|hourly|today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|january|february|march|april|may|june|july|august|september|october|november|december)\b/i.test(s);
   if (wantsValue) for (let i = ranked.length - 1; i >= 0; i--) if (!hasValue(ranked[i][1])) ranked.splice(i, 1);
   let good = ranked.filter(x => x[0] > MIN_RERANK), lowConfidence = false;
   if (good.length) {
