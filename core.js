@@ -101,7 +101,11 @@ function sharesSpecificTerm(qTerms, sentence, source) {
   const hits = specific.filter(match).length;
   return hits >= 1 && hits >= Math.ceil(specific.length / 2);
 }
-export async function answer(index, question, k = 3, maxSentences = 2) {
+// Weak tier: closest text when nothing scores as a clear match. Floor chosen by eye from score tables on my own
+// small test sets (misses had their right line at -0.7 to -5.8, unsupported questions anywhere from -0.4 to -11).
+const WEAK_FLOOR = -6.5;
+const PASSAGE_RATIO = 0.35; // a further passage needs at least this share of the best score
+export async function answer(index, question, k = 3, maxPassages = 3) {
   const qTerms = new Set(tokenize(question));
   const hits = await index.search(question, k);
   if (!hits.length || !qTerms.size) return { question, answer: null, abstained: true, citations: [] };
@@ -130,17 +134,25 @@ export async function answer(index, question, k = 3, maxSentences = 2) {
   const wantsValue = /^\s*(when|how (many|much|long|often|soon|far|old|fast|big))\b|\b(latest|earliest|deadline|by when|what date|what time)\b/i.test(question);
   const hasValue = s => /\d|\b(one|two|three|four|five|six|seven|eight|nine|ten|twelve|hundred|thousand|free|nothing|none|no charge|no cost|half|double|immediately|upon|after|before|until|once|during|within|following|next|every|each|per|never|always|daily|weekly|monthly|yearly|annual|quarterly|hourly|today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|january|february|march|april|may|june|july|august|september|october|november|december)\b/i.test(s);
   if (wantsValue) for (let i = ranked.length - 1; i >= 0; i--) if (!hasValue(ranked[i][1])) ranked.splice(i, 1);
-  let good = ranked.filter(x => x[0] > MIN_RERANK), lowConfidence = false;
-  if (good.length) {
-    const best = good[0][0];
-    good = good.filter(x => x[0] >= SECOND_RATIO * best).slice(0, maxSentences);
-  } else if (!wantsValue && ranked.length > 1 && ranked[0][0] > LOW_FLOOR && ranked[0][0] - ranked[1][0] >= LOW_MARGIN
-             && sharesSpecificTerm(qTerms, ranked[0][1], ranked[0][2].source)) {
-    good = [ranked[0]]; lowConfidence = true;
+  // Result tiers. "match": passages the cross-encoder scores as relevant. "related": weaker passages that still
+  // share the question's own words (not just the file's topic word). Nothing else is shown. Passages are
+  // quoted verbatim with their neighbouring sentences; none of this is presented as a verified answer.
+  const dbg = ranked.slice(0, 4).map(r => [+r[0].toFixed(2), r[1]]);
+  const mk = ([sc, s, c], n) => {
+    const k = (c.sents || []).indexOf(s);
+    return { n, source: c.source, page: c.page, chunkId: c.id, quote: s, score: +sc.toFixed(3),
+             before: k > 0 ? c.sents[k - 1] : "", after: k >= 0 && k < (c.sents || []).length - 1 ? c.sents[k + 1] : "" };
+  };
+  let picked = ranked.filter(x => x[0] > MIN_RERANK), tier = "match";
+  if (picked.length) { picked = picked.filter(x => x[0] >= PASSAGE_RATIO * picked[0][0]).slice(0, maxPassages); }
+  else {
+    tier = "related";
+    picked = ranked.filter(x => x[0] > WEAK_FLOOR && !HEADINGS.has(x[1]) && x[1].trim().split(/\s+/).length > 3).slice(0, 2);
   }
-  if (!good.length) return { question, answer: null, abstained: true, citations: [] };
-  const citations = good.map(([sc, s, c], i) => ({ n: i + 1, source: c.source, page: c.page, chunkId: c.id, quote: s, score: +sc.toFixed(3) }));
-  return { question, answer: citations.map(c => `${c.quote} [${c.n}]`).join(" "), abstained: false, lowConfidence, citations };
+  if (!picked.length) return { question, answer: null, abstained: true, passages: [], citations: [], dbg };
+  const passages = picked.map((p, i) => mk(p, i + 1));
+  return { question, abstained: false, tier, lowConfidence: tier === "related", dbg, passages, citations: passages,
+           answer: passages.map(c => `${c.quote} [${c.n}]`).join(" ") };
 }
 
 // Models via Transformers.js (ONNX). `T` is the imported transformers module.

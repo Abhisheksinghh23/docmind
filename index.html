@@ -28,12 +28,13 @@
   .msg { font-size:14px; color:var(--muted); margin-top:8px; }
   .ok { color:var(--ok); }
   @media (max-width: 480px) { h1 { font-size: 24px; } button { flex: 1 1 100%; } }
+.ctx{color:#6b7280}mark{background:#fff3b0;padding:0 2px;border-radius:3px;color:inherit}
 </style>
 </head>
 <body>
 <main>
   <h1>DocMind</h1>
-  <p class="sub">Ask a question about your documents. Everything runs in your browser: files are never uploaded. Answers quote the exact passage with file and page. It may still miss answers or show a loosely related line when the documents don't say, so check the quoted source.</p>
+  <p class="sub">Ask a question about your documents. Everything runs in your browser: files are never uploaded. It shows the closest passages with file and page, and may miss relevant ones or show loosely related ones, so check the quoted source.</p>
 
   <section class="card">
     <h2>1. Add documents (.txt, .md or .pdf)</h2>
@@ -106,13 +107,15 @@ $('upload').onclick = async () => {
 $('askform').onsubmit = async e => {
   e.preventDefault();
   $('ask').disabled = true; $('result').innerHTML = '<p class="msg">Searching...</p>';
-  const a = await answer(index, $('q').value);
-  if (a.abstained) { $('result').innerHTML = '<p class="answer abstain">The documents do not contain a clear answer to that.</p>'; }
+  const a = await answer(index, $('q').value); window.__last = a;
+  if (a.abstained) { $('result').innerHTML = '<p class="answer abstain">Nothing in your documents looks close to that question. Try other words from the document.</p>'; }
   else {
-    const text = a.citations.map(c => `${esc(c.quote)}<span class="cite">${c.n}</span>`).join(' ');
-    const src = a.citations.map(c => `<div class="source"><div class="meta">[${c.n}] ${esc(c.source)}, page ${c.page}</div>${esc(c.quote)}</div>`).join('');
-    const lc = a.lowConfidence ? '<p class="msg abstain">Low confidence: best matching line, not a clear answer. Check the source below.</p>' : '';
-    $('result').innerHTML = `${lc}<p class="answer">${text}</p>${src}`;
+    const head = a.tier === 'match'
+      ? '<p class="msg">Closest passages from your documents. This is a search result, not a checked answer: read the source lines.</p>'
+      : '<p class="msg abstain">No clear match. This is the closest text I found and it may not answer your question.</p>';
+    const cards = a.passages.map(c => `<div class="source"><div class="meta">[${c.n}] ${esc(c.source)}, page ${c.page}${c.n === 1 && a.tier === 'match' ? ', best match' : ''}</div>` +
+      (c.before ? `<span class="ctx">${esc(c.before)} </span>` : '') + `<mark>${esc(c.quote)}</mark>` + (c.after ? `<span class="ctx"> ${esc(c.after)}</span>` : '') + '</div>').join('');
+    $('result').innerHTML = head + cards;
   }
   $('ask').disabled = false; window.__answered = true;
 };
